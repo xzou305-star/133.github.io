@@ -1,0 +1,480 @@
+<!DOCTYPE html><html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+    <title>步态分析代码 - 在线查看器</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet" />
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            background: #1e1e2f;
+            font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+            padding: 20px;
+            color: #f0f0f0;
+        }
+        .container {
+            max-width: 1300px;
+            margin: 0 auto;
+            background: #282a36;
+            border-radius: 24px;
+            overflow: hidden;
+            box-shadow: 0 20px 35px -10px rgba(0,0,0,0.5);
+        }
+        .header {
+            background: #1e1e2a;
+            padding: 20px 28px;
+            border-bottom: 1px solid #44475a;
+        }
+        .header h1 {
+            font-size: 1.8rem;
+            font-weight: 600;
+            background: linear-gradient(135deg, #8be9fd, #bd93f9);
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+            letter-spacing: -0.3px;
+        }
+        .header p {
+            color: #a0a0c0;
+            margin-top: 8px;
+            font-size: 0.95rem;
+        }
+        .code-wrapper {
+            padding: 24px;
+            overflow-x: auto;
+        }
+        pre {
+            margin: 0 !important;
+            border-radius: 16px !important;
+            background: #1e1e2e !important;
+            font-size: 14px;
+            font-family: 'Fira Code', 'JetBrains Mono', 'Cascadia Code', monospace;
+        }
+        code {
+            font-size: 0.85rem;
+            line-height: 1.5;
+        }
+        .footer {
+            background: #1e1e2a;
+            padding: 16px 28px;
+            text-align: center;
+            font-size: 0.8rem;
+            color: #7f7f9f;
+            border-top: 1px solid #44475a;
+        }
+        .footer a {
+            color: #8be9fd;
+            text-decoration: none;
+        }
+        @media (max-width: 640px) {
+            body { padding: 12px; }
+            .code-wrapper { padding: 16px; }
+            pre { font-size: 12px; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1>🚶 步态分析工具 · 完整代码</h1>
+        <p>基于 MediaPipe 的姿态估计 | 膝关节/髋关节角度 | 步频与步态事件检测</p>
+    </div>
+    <div class="code-wrapper">
+        <pre><code class="language-python">"""
+步态分析工具 - 基于MediaPipe姿态估计
+功能：从视频中提取人体下肢关键点，计算髋/膝/踝关节角度，检测步态事件，输出步频和步态周期
+依赖：pip install opencv-python mediapipe numpy matplotlib scipy
+使用方法：python gait_analysis.py --video path/to/video.mp4
+"""
+
+import cv2
+import mediapipe as mp
+import numpy as np
+import argparse
+from collections import deque
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+class GaitAnalyzer:
+    def __init__(self, fps=30):
+        """
+        初始化步态分析器
+        Args:
+            fps: 视频帧率，用于时间计算
+        """
+        self.fps = fps
+        self.mp_pose = mp.solutions.pose
+        self.pose = self.mp_pose.Pose(
+            static_image_mode=False,
+            model_complexity=1,
+            smooth_landmarks=True,
+            enable_segmentation=False,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        self.mp_draw = mp.solutions.drawing_utils
+        
+        # 存储数据
+        self.frame_times = []      # 每帧时间戳(秒)
+        self.left_angles = []      # 左膝关节角度
+        self.right_angles = []     # 右膝关节角度
+        self.left_hip_angles = []  # 左髋关节角度
+        self.right_hip_angles = [] # 右髋关节角度
+        self.left_ankle_y = []     # 左脚踝y坐标(用于步态事件检测)
+        self.right_ankle_y = []    # 右脚踝y坐标
+        self.gait_events = {'left_ic': [], 'left_to': [], 'right_ic': [], 'right_to': []}  # 触地(IC)和离地(TO)
+        
+    def calculate_angle(self, a, b, c):
+        """
+        计算三点构成的角度(向量夹角)
+        Args:
+            a,b,c: 三个点的坐标(x,y)
+        Returns:
+            角度值(度)，范围0-180
+        """
+        a = np.array(a)
+        b = np.array(b)
+        c = np.array(c)
+        
+        ba = a - b
+        bc = c - b
+        cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
+        angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
+        return np.degrees(angle)
+    
+    def get_joint_coords(self, landmarks, joint_indices, img_shape):
+        """
+        获取关节坐标并转换为像素坐标
+        Args:
+            landmarks: MediaPipe检测到的关键点
+            joint_indices: 关键点索引列表
+            img_shape: 图像尺寸(height, width)
+        Returns:
+            坐标列表[(x,y), ...]
+        """
+        h, w = img_shape[:2]
+        coords = []
+        for idx in joint_indices:
+            lm = landmarks[idx]
+            # 检查可见度，若太低则返回None
+            if lm.visibility < 0.5:
+                coords.append(None)
+            else:
+                coords.append((int(lm.x * w), int(lm.y * h)))
+        return coords
+    
+    def process_frame(self, frame, timestamp):
+        """
+        处理单帧图像，提取步态参数
+        Args:
+            frame: BGR图像
+            timestamp: 当前帧时间戳(秒)
+        Returns:
+            annotated_frame: 标注后的图像
+        """
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.pose.process(rgb_frame)
+        
+        annotated_frame = frame.copy()
+        if not results.pose_landmarks:
+            # 未检测到人体，存储NaN
+            self.frame_times.append(timestamp)
+            self.left_angles.append(np.nan)
+            self.right_angles.append(np.nan)
+            self.left_hip_angles.append(np.nan)
+            self.right_hip_angles.append(np.nan)
+            self.left_ankle_y.append(None)
+            self.right_ankle_y.append(None)
+            return annotated_frame
+        
+        # 绘制骨架
+        self.mp_draw.draw_landmarks(
+            annotated_frame, 
+            results.pose_landmarks, 
+            self.mp_pose.POSE_CONNECTIONS,
+            landmark_drawing_spec=self.mp_draw.DrawingSpec(color=(0,255,0), thickness=2, circle_radius=2),
+            connection_drawing_spec=self.mp_draw.DrawingSpec(color=(255,255,0), thickness=2)
+        )
+        
+        h, w = frame.shape[:2]
+        landmarks = results.pose_landmarks.landmark
+        
+        # 定义关键点索引 (MediaPipe Pose)
+        # 左腿: 左髋(23), 左膝(25), 左踝(27), 左足跟(29), 左足趾(31)
+        # 右腿: 右髋(24), 右膝(26), 右踝(28), 右足跟(30), 右足趾(32)
+        # 躯干参考: 左肩(11), 右肩(12)
+        left_hip_idx, left_knee_idx, left_ankle_idx = 23, 25, 27
+        right_hip_idx, right_knee_idx, right_ankle_idx = 24, 26, 28
+        left_shoulder_idx, right_shoulder_idx = 11, 12
+        left_heel_idx, left_foot_idx = 29, 31
+        right_heel_idx, right_foot_idx = 30, 32
+        
+        # 获取坐标
+        left_hip = self.get_joint_coords(landmarks, [left_hip_idx], (h,w))[0]
+        left_knee = self.get_joint_coords(landmarks, [left_knee_idx], (h,w))[0]
+        left_ankle = self.get_joint_coords(landmarks, [left_ankle_idx], (h,w))[0]
+        left_shoulder = self.get_joint_coords(landmarks, [left_shoulder_idx], (h,w))[0]
+        left_heel = self.get_joint_coords(landmarks, [left_heel_idx], (h,w))[0]
+        left_foot = self.get_joint_coords(landmarks, [left_foot_idx], (h,w))[0]
+        
+        right_hip = self.get_joint_coords(landmarks, [right_hip_idx], (h,w))[0]
+        right_knee = self.get_joint_coords(landmarks, [right_knee_idx], (h,w))[0]
+        right_ankle = self.get_joint_coords(landmarks, [right_ankle_idx], (h,w))[0]
+        right_shoulder = self.get_joint_coords(landmarks, [right_shoulder_idx], (h,w))[0]
+        right_heel = self.get_joint_coords(landmarks, [right_heel_idx], (h,w))[0]
+        right_foot = self.get_joint_coords(landmarks, [right_foot_idx], (h,w))[0]
+        
+        # 计算膝关节角度 (髋-膝-踝)
+        left_knee_angle = self.calculate_angle(left_hip, left_knee, left_ankle) if all([left_hip, left_knee, left_ankle]) else np.nan
+        right_knee_angle = self.calculate_angle(right_hip, right_knee, right_ankle) if all([right_hip, right_knee, right_ankle]) else np.nan
+        
+        # 计算髋关节角度 (肩-髋-膝)
+        left_hip_angle = self.calculate_angle(left_shoulder, left_hip, left_knee) if all([left_shoulder, left_hip, left_knee]) else np.nan
+        right_hip_angle = self.calculate_angle(right_shoulder, right_hip, right_knee) if all([right_shoulder, right_hip, right_knee]) else np.nan
+        
+        # 存储数据
+        self.frame_times.append(timestamp)
+        self.left_angles.append(left_knee_angle)
+        self.right_angles.append(right_knee_angle)
+        self.left_hip_angles.append(left_hip_angle)
+        self.right_hip_angles.append(right_hip_angle)
+        self.left_ankle_y.append(left_ankle[1] if left_ankle else None)
+        self.right_ankle_y.append(right_ankle[1] if right_ankle else None)
+        
+        # 在图像上显示角度
+        if left_knee and left_ankle:
+            cv2.putText(annotated_frame, f"L Knee: {int(left_knee_angle)}", (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+        if right_knee and right_ankle:
+            cv2.putText(annotated_frame, f"R Knee: {int(right_knee_angle)}", (10, 60), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+        
+        return annotated_frame
+    
+    def detect_gait_events(self, ankle_y_series, threshold_factor=0.3):
+        """
+        基于脚踝垂直坐标检测步态事件(触地IC和离地TO)
+        原理：站立相时脚踝位置较低(y较大)，摆动相时脚踝抬高(y较小)
+        通过局部最小值和最大值识别
+        Args:
+            ankle_y_series: 脚踝y坐标序列(可能含None)
+            threshold_factor: 极值检测阈值系数
+        Returns:
+            ic_frames: 触地帧索引列表
+            to_frames: 离地帧索引列表
+        """
+        # 插值处理缺失值
+        y_vals = []
+        for v in ankle_y_series:
+            if v is None:
+                y_vals.append(np.nan)
+            else:
+                y_vals.append(v)
+        # 线性插值填充
+        y_vals = np.array(y_vals)
+        nan_mask = np.isnan(y_vals)
+        if np.all(nan_mask):
+            return [], []
+        y_vals[nan_mask] = np.interp(np.flatnonzero(nan_mask), np.flatnonzero(~nan_mask), y_vals[~nan_mask])
+        
+        # 平滑滤波
+        from scipy.signal import savgol_filter
+        try:
+            window = min(11, len(y_vals)//2*2+1)
+            if window >= 3:
+                y_smooth = savgol_filter(y_vals, window, 2)
+            else:
+                y_smooth = y_vals
+        except:
+            y_smooth = y_vals
+        
+        # 检测局部最小(触地)和局部最大(离地)
+        ic_frames = []
+        to_frames = []
+        # 简单的一阶差分过零检测
+        dy = np.diff(y_smooth)
+        for i in range(1, len(y_smooth)-1):
+            if dy[i-1] < 0 and dy[i] >= 0:  # 由下降转上升 -> 局部最小
+                ic_frames.append(i)
+            elif dy[i-1] > 0 and dy[i] <= 0:  # 由上升转下降 -> 局部最大
+                to_frames.append(i)
+        
+        # 过滤幅度过小的波动(阈值基于序列标准差)
+        std = np.std(y_smooth)
+        if std > 0:
+            ic_frames = [i for i in ic_frames if y_smooth[i] < np.mean(y_smooth) - threshold_factor*std]
+            to_frames = [i for i in to_frames if y_smooth[i] > np.mean(y_smooth) + threshold_factor*std]
+        
+        return ic_frames, to_frames
+    
+    def compute_gait_parameters(self):
+        """
+        计算步态参数: 步频(步/分钟)、步态周期(秒)、左右对称性等
+        """
+        # 检测左右脚步态事件
+        left_ic, left_to = self.detect_gait_events(self.left_ankle_y)
+        right_ic, right_to = self.detect_gait_events(self.right_ankle_y)
+        
+        self.gait_events['left_ic'] = left_ic
+        self.gait_events['left_to'] = left_to
+        self.gait_events['right_ic'] = right_ic
+        self.gait_events['right_to'] = right_to
+        
+        # 计算步频(基于左脚触地间隔)
+        if len(left_ic) >= 2:
+            # 将帧索引转换为时间
+            ic_times = [self.frame_times[i] for i in left_ic if i < len(self.frame_times)]
+            if len(ic_times) >= 2:
+                avg_cycle = np.mean(np.diff(ic_times))  # 平均步态周期(秒)
+                cadence = 60.0 / avg_cycle  # 步频(步/分钟)
+            else:
+                avg_cycle, cadence = np.nan, np.nan
+        else:
+            avg_cycle, cadence = np.nan, np.nan
+        
+        # 计算平均膝关节角度范围
+        left_knee_range = np.nanmax(self.left_angles) - np.nanmin(self.left_angles) if len(self.left_angles) > 0 else np.nan
+        right_knee_range = np.nanmax(self.right_angles) - np.nanmin(self.right_angles) if len(self.right_angles) > 0 else np.nan
+        
+        params = {
+            'cadence_steps_per_min': cadence,
+            'avg_gait_cycle_sec': avg_cycle,
+            'left_knee_ROM_deg': left_knee_range,
+            'right_knee_ROM_deg': right_knee_range,
+            'left_stance_phases': len(left_ic),  # 触地次数近似站立相次数
+            'right_stance_phases': len(right_ic),
+            'total_frames': len(self.frame_times),
+            'duration_sec': self.frame_times[-1] - self.frame_times[0] if self.frame_times else 0
+        }
+        return params
+    
+    def plot_results(self, save_path=None):
+        """
+        绘制角度曲线和步态事件
+        """
+        if not self.frame_times:
+            print("无数据可绘制")
+            return
+        
+        times = np.array(self.frame_times)
+        fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+        
+        # 膝关节角度曲线
+        axes[0].plot(times, self.left_angles, label='Left Knee', color='b', alpha=0.7)
+        axes[0].plot(times, self.right_angles, label='Right Knee', color='r', alpha=0.7)
+        # 标记步态事件
+        for ic in self.gait_events['left_ic']:
+            if ic < len(times):
+                axes[0].axvline(x=times[ic], color='b', linestyle='--', alpha=0.5, linewidth=0.8)
+        for ic in self.gait_events['right_ic']:
+            if ic < len(times):
+                axes[0].axvline(x=times[ic], color='r', linestyle='--', alpha=0.5, linewidth=0.8)
+        axes[0].set_ylabel('Knee Angle (deg)')
+        axes[0].set_title('Knee Angle During Gait')
+        axes[0].legend()
+        axes[0].grid(True)
+        
+        # 髋关节角度曲线
+        axes[1].plot(times, self.left_hip_angles, label='Left Hip', color='c', alpha=0.7)
+        axes[1].plot(times, self.right_hip_angles, label='Right Hip', color='m', alpha=0.7)
+        axes[1].set_xlabel('Time (s)')
+        axes[1].set_ylabel('Hip Angle (deg)')
+        axes[1].set_title('Hip Angle During Gait')
+        axes[1].legend()
+        axes[1].grid(True)
+        
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path)
+            print(f"曲线图已保存至: {save_path}")
+        plt.show()
+    
+    def print_summary(self):
+        """打印步态分析摘要"""
+        params = self.compute_gait_parameters()
+        print("\n========== 步态分析结果 ==========")
+        print(f"分析时长: {params['duration_sec']:.2f} 秒")
+        print(f"总帧数: {params['total_frames']}")
+        print(f"步频: {params['cadence_steps_per_min']:.1f} 步/分钟" if not np.isnan(params['cadence_steps_per_min']) else "步频: 无法计算(检测到的步数不足)")
+        print(f"平均步态周期: {params['avg_gait_cycle_sec']:.2f} 秒" if not np.isnan(params['avg_gait_cycle_sec']) else "平均步态周期: 无法计算")
+        print(f"左膝关节活动范围: {params['left_knee_ROM_deg']:.1f} 度" if not np.isnan(params['left_knee_ROM_deg']) else "左膝关节活动范围: N/A")
+        print(f"右膝关节活动范围: {params['right_knee_ROM_deg']:.1f} 度" if not np.isnan(params['right_knee_ROM_deg']) else "右膝关节活动范围: N/A")
+        print(f"左脚触地次数: {params['left_stance_phases']}")
+        print(f"右脚触地次数: {params['right_stance_phases']}")
+        print("==================================\n")
+
+def main():
+    parser = argparse.ArgumentParser(description='步态分析工具 - 基于视频的姿态估计')
+    parser.add_argument('--video', type=str, help='输入视频文件路径(若不提供则使用摄像头)')
+    parser.add_argument('--fps', type=float, default=30.0, help='视频帧率(默认30，自动从视频读取优先)')
+    parser.add_argument('--output_plot', type=str, default='gait_curves.png', help='输出曲线图保存路径')
+    args = parser.parse_args()
+    
+    # 打开视频源
+    if args.video:
+        cap = cv2.VideoCapture(args.video)
+        if not cap.isOpened():
+            print(f"错误: 无法打开视频文件 {args.video}")
+            return
+        # 获取实际帧率
+        actual_fps = cap.get(cv2.CAP_PROP_FPS)
+        if actual_fps > 0:
+            fps = actual_fps
+        else:
+            fps = args.fps
+        print(f"使用视频文件: {args.video}, 帧率: {fps:.2f}")
+    else:
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            print("错误: 无法打开摄像头")
+            return
+        fps = args.fps
+        print(f"使用摄像头, 设定帧率: {fps:.2f}")
+    
+    analyzer = GaitAnalyzer(fps=fps)
+    
+    frame_idx = 0
+    start_time = None
+    
+    print("开始步态分析, 按 'q' 键退出...")
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        if start_time is None:
+            start_time = 0
+        timestamp = frame_idx / fps
+        
+        annotated = analyzer.process_frame(frame, timestamp)
+        cv2.imshow('Gait Analysis', annotated)
+        
+        frame_idx += 1
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+    
+    cap.release()
+    cv2.destroyAllWindows()
+    
+    if len(analyzer.frame_times) > 0:
+        analyzer.print_summary()
+        analyzer.plot_results(save_path=args.output_plot)
+    else:
+        print("未检测到任何有效帧，请检查视频中是否有人体。")
+
+if __name__ == "__main__":
+    main()</code></pre>
+    </div>
+    <div class="footer">
+        📄 代码基于 MediaPipe + OpenCV | 依赖安装: <code style="background:#2d2d3a; padding:2px 6px; border-radius:8px;">pip install opencv-python mediapipe numpy matplotlib scipy</code><br>
+        💡 使用方法: 将本文件保存为 <strong>.html</strong>，在任何设备浏览器中打开即可查看（支持手机/电脑）
+    </div>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+</body>
+</html>
